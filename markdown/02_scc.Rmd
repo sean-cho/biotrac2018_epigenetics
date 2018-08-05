@@ -1,0 +1,284 @@
+---
+title: "Squamous Cell Carcinoma"
+author: "Sean Cho"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+```{r libs, warning=FALSE,message=FALSE}
+library(GEOquery)
+library(minfi)
+library(limma)
+library(gplots)
+library(scales)
+```
+
+For this task, we will be analysing a public dataset on the Gene Expression Omnibus (GEO), GSE67097.
+We will be doing the following:
+
+1. Download the data
+2. Process the metadata
+3. Read the raw .idat files
+4. Perform QC analysis
+5. Normalize the data
+6. Get beta-values or M-values
+7. Identify differentially methylated probes (DMPs)
+8. Identify differentually methylated regions (DMRs)
+
+## Download dataset
+
+We will be using the `GEOquery` package to download the GSE67097 dataset. We will first download the supplementary files. This next code chunk will: 
+
+1. create the necessary directories for download 
+2. download and parse data into appropriate directories
+3. get a list of idat files to be passed on to be read
+
+```{r downloadgeo}
+if(length(list.files('data/scc/GSE67097/idat')) != 26){
+    ## functions
+    movefiles <- function(from){
+      to <- gsub('data/scc/GSE67097','data/scc/GSE67097/idat', from)
+      file.rename(from, to)
+    }
+    
+    ## create directories
+    sapply(c('data','rda','output'), dir.create)
+    
+    #### get data
+    ## download raw data and move data
+    dir.create('data/scc', recursive = TRUE) ## create data directory
+    getGEOSuppFiles('GSE67097', baseDir = 'data/scc') ## download IDAT files
+    untar(tarfile = 'data/scc/GSE67097/GSE67097_RAW.tar', exdir = 'data/scc/GSE67097') ## untar file
+    dir.create('data/scc/GSE67097/idat') ## create idat directory to store idat file
+    
+    idat_files <- list.files('data/scc/GSE67097/', pattern = 'idat.gz', full.names = TRUE)
+    sapply(idat_files, movefiles) ## move files into idat folder
+    idat_files <- list.files('data/scc/GSE67097/idat', pattern = 'idat.gz', full.names = TRUE)
+    sapply(idat_files, gunzip, overwrite = TRUE) ## unzip files
+}
+
+idat_files <- list.files('data/scc/GSE67097/idat', pattern = 'idat$', full.names = TRUE)
+idat_files
+```
+
+## Process metadata
+
+Next, we will download the phenotype metadata using GEOquery. `getGEO` will download all the data into a `list` because some GSE entries has multiple associated data sets. GSE67097 only has one so we will extract the data using `[[1]]`.
+
+```{r phenodata01}
+## get phenodata
+gse <- getGEO('GSE67097')
+rawpheno <- pData(gse[[1]])
+str(rawpheno)
+```
+
+There are several columns of information here that we want to capture, including the tissue, gender, body source, tumor type, and if the skin source is exposed to the sun.
+
+The `dl_metadata` data.frame will be used to import the raw data appropriately. The required columns are as follows:
+
+1. `Slide`: The array chip ID
+2. `Array`: The position on the chip
+3. `Basename`: Location of the idat file
+
+Any other columns will be appended onto the phenotype data when the data is read.
+
+```{r phenodata02}
+## create metadata for reading data using minfi
+dl_metadata <- data.frame(do.call(rbind, strsplit(basename(idat_files), split = '_')),
+                          stringsAsFactors = FALSE)
+colnames(dl_metadata) <- c('Sample_Name', 'Slide', 'Array', 'suffix')
+dl_metadata$Basename <- gsub('_[GrnRed]+\\.idat','', idat_files)
+dl_metadata$suffix <- NULL
+dl_metadata <- unique(dl_metadata)
+
+## annotate metadata
+sun <- c('Lip','Neck','Scalp','Arm')
+nosun <- c('Calf','Leg')
+
+dl_metadata$OTissue <- rawpheno$`tissue:ch1`
+dl_metadata$OGender <- rawpheno$`gender:ch1`
+dl_metadata$OBody <- rawpheno$`body site:ch1`
+dl_metadata$Tumor <- ifelse(grepl('squamous', rawpheno$`tissue:ch1`), 'SCC', 'normal')
+dl_metadata$Sun <- ifelse(dl_metadata$OBody %in% sun, 'sun', 'nosun')
+
+head(dl_metadata)
+```
+
+## Read raw IDAT data
+
+We will use `read.metharray.exp` from the `minfi` package with the `dl_metadata` data.frame to read the raw idat file. 
+
+The data is read into an `RGChannelSet` (red/green channel set) which is a structured object that stores the raw signal intensities, annotation information about the array, and phenotype data as provided by the targets argument (in our case `dl_metadata`).
+
+We will extract the phenotype information using `pData` which will be ordered the same way as the signal intensity information.
+
+```{r readidat}
+## read data
+rawdata <- read.metharray.exp(targets = dl_metadata)
+class(rawdata)
+## save rawdata for future experiments
+if(!file.exists('data/scc/scc_rawdata.rds')){
+  saveRDS(rawdata, file = 'data/scc/scc_rawdata.rds')
+}
+## start analysis
+pheno <- pData(rawdata)
+head(pheno)
+```
+
+## QC 
+
+We can perform a QC analysis using the convenient `qcReport` function from `minfi` which plots the beta-value distributions of all the samples and the intensities of control probes. We can look at the output file to identify outliers that should be excluded from the analysis.
+
+```{r qc}
+qcReport(rawdata, pdf = 'output/ssc_qc.pdf')
+```
+
+There are no outliers in this dataset so we will proceed with the analysis.
+
+## Normalization
+
+We will be using `preprocessFunnorm` to perform data normalization across the samples using the functional normalization algorithm. This will change the `RGChannelSet` into a `GenomicRatioSet`, which now contains beta-values.
+
+```{r normalization}
+## normalization
+fndata <- preprocessFunnorm(rawdata)
+```
+
+## Get methylation values
+
+Next, we extract the methylation values as beta-values and M-values. We will be using M-values in a linear model to identify differentially methylated probes. We will be using beta-values to filter the analysis results and interpret the data since differences in beta-values are more intuitive than M-values.
+
+```{r getdata}
+## beta values
+Bdat <- getBeta(fndata)
+head(colnames(Bdat))
+## fix column names
+colnames(Bdat) <- sapply(colnames(Bdat), function(x) strsplit(x, '_')[[1]][1])
+head(colnames(Bdat))
+bdat <- Bdat
+head(bdat)
+
+## M values
+Mdat <- getM(fndata)
+colnames(Mdat) <- sapply(colnames(Mdat), function(x) strsplit(x, '_')[[1]][1])
+Mdat[Mdat==Inf] <- max(Mdat[Mdat!=Inf])
+Mdat[Mdat==-Inf] <- min(Mdat[Mdat!=-Inf])
+mdat <- Mdat
+head(mdat)
+```
+
+## Identify DMPs using minfi
+
+`minfi` has a convenience function called `dmpFinder` that can be used to identify differentially methylated probes. It accepts a matrix of beta or M-values and a vector of phenotype to run the comparison against.
+
+In our analysis, that would be `pheno$Tumor`.
+
+```{r dmpfinder}
+dmpres <- dmpFinder(mdat, pheno$Tumor)
+sum(dmpres$qval <= 0.05)
+```
+
+Here, we have `sum(dmpres$qval <= 0.05)` DMPs from running `dmpFinder`.
+
+## Identify DMPs using limma
+
+While `dmpFinder` is convenient, it doesn't allow us to include covariates in our linear model.
+We will use the `limma` package to identify differentially methylated probes (DMPs), which is what goes on under the hood of `dmpFinder`.
+
+### Design matrix and contrasts
+
+We will create a design matrix using the `model.matrix` function that captures information about the phenotype of interest and covariates that could capture other sources of biological variation. We will create appropriate contrasts for the design matrix that will calculate differences in the groups of interest.
+
+```{r dmp}
+## make model matrix and contrasts
+sccmodel <- model.matrix(~ 0 + pheno$Tumor + pheno$OGender)
+colnames(sccmodel) <- c('normal','scc','gender')
+scc_contrasts <- makeContrasts(scc - normal, levels = sccmodel)
+```
+
+### Fit the model
+
+We will use `lmFit`, `contrasts.fit`, and `eBayes` to identify the DMPs. Then, we will use `top.table` to extract the DMPs.
+
+Next, we will flag DMPs using the following filters:
+
+1. FDR <= 0.05 in the M-value analysis
+2. abs(delta beta) >= 0.3 in the beta-value analysis
+
+```{r fit}
+## fit model
+sccfit1 <- lmFit(mdat, design = sccmodel)
+sccfit2 <- contrasts.fit(sccfit1, scc_contrasts)
+sccfiteb <- eBayes(sccfit2)
+scc_res <- topTable(sccfiteb, coef = 1, number = nrow(mdat))
+
+## do the same for beta values
+sccfit1b <- lmFit(bdat, design = sccmodel)
+sccfit2b <- contrasts.fit(sccfit1b, scc_contrasts)
+sccfitebb <- eBayes(sccfit2b)
+scc_resb <- topTable(sccfitebb, coef = 1, number = nrow(bdat))
+
+## flag differentially methylated probes
+dmps <- rownames(scc_res)[scc_res$adj.P.Val <= 0.05] ## FDR < 0.05 in M-value
+dmps <- dmps[abs(scc_resb[dmps,]$logFC) >= 0.3] ## delta beta >= 0.3
+scc_resb$DMP <- rownames(scc_resb) %in% dmps
+
+head(scc_resb)
+```
+
+The `topTable` result has 6 columns:
+
+1. logFC: delta-beta of log fold change of M-values
+2. AveExpr: average methylation value across all samples
+3. t: moderated t-statistic
+4. P.Value: p-value
+5. adj.P.Val: p-value adjusted using FDR
+6. B: B-statistic (log-odds of differential methylation)
+
+### Plot result
+
+We will visualise the data using a volcano plot, which plots delta beta on the x-axis and -log10 FDR on the y-axis. We will color DMPs orange and the non-significant probes skyblue.
+
+```{r volcano}
+plot(x = scc_resb$logFC, y = -log10(scc_resb$adj.P.Val), 
+     col = ifelse(scc_resb$DMP, 'orange', 'skyblue'), pch = 16,
+     ylab = '-log10 FDR', xlab = 'Delta Beta', main = 'Differentially Methylated Probes')
+```
+
+## Identify DMRs
+
+The `DMRcate` package can be used to identify differentially methylated regions by comparing DMPs in windows across the genome. As an added bonus, `DMR.plot` also annotates the plot with nearby DNA elements of interest.
+
+```{r dmr}
+library(DMRcate)
+## annotate
+scc_dmrdat <- cpg.annotate(object = mdat, datatype = 'array', 
+                          what = 'M', design = sccmodel, 
+                          arraytype = '450K', contrasts = TRUE, 
+                          cont.matrix = scc_contrasts,
+                          coef = 'scc - normal')
+# contrasts
+scc_dmr <- dmrcate(scc_dmrdat)
+scc_dmranges <- extractRanges(scc_dmr, genome = 'hg19')
+plot(x = scc_dmranges$meanbetafc, y = -log10(scc_dmranges$Stouffer),
+     col = ifelse(abs(scc_dmranges$meanbetafc) >= 0.3 & 
+                    scc_dmranges$Stouffer < 0.01,'orange','skyblue'),
+     pch = 16, xlab = 'Mean Beta FC', ylab = '-log10 Stouffer p-value',
+     main = 'Volcano plot of DMRs')
+
+## create colors
+colgrp <- c('SCC' = 'orange', 'normal' = 'skyblue3')[pheno$Tumor] 
+
+DMR.plot(ranges = scc_dmranges, dmr = 13, CpGs=bdat, 
+         phen.col =  colgrp,
+         what = 'Beta', arraytype = '450K', pch = 16, plotmedians = TRUE, genome='hg19', 
+         samps = 1:ncol(bdat), toscale = TRUE)
+```
+
