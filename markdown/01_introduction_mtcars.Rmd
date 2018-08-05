@@ -1,0 +1,155 @@
+---
+title: 'Introduction to R: mtcars'
+author: "Sean Cho"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load dataset
+
+We will be working with the `mtcars` dataset. We will first load the dataset and then find out more about the dataset.
+
+We can use `?` or `help` to get information about `function`s. We can also use them to find out more about datasets, including `mtcars`.
+
+```{r mtcars}
+data('mtcars')
+?mtcars
+
+## A data frame with 32 observations on 11 (numeric) variables.
+##
+## [, 1]	mpg	Miles/(US) gallon
+## [, 2]	cyl	Number of cylinders
+## [, 3]	disp	Displacement (cu.in.)
+## [, 4]	hp	Gross horsepower
+## [, 5]	drat	Rear axle ratio
+## [, 6]	wt	Weight (1000 lbs)
+## [, 7]	qsec	1/4 mile time
+## [, 8]	vs	Engine (0 = V-shaped, 1 = straight)
+## [, 9]	am	Transmission (0 = automatic, 1 = manual)
+## [,10]	gear	Number of forward gears
+## [,11]	carb	Number of carburetors
+```
+
+## Examine dataset
+
+We can look at the structure of `mtcars` using the `str()`.
+
+```{r mtcars_examine}
+str(mtcars)
+```
+
+We can see that the `data.frame` has 11 variables, or columns, and 32 observations, or rows. Although all of these are numeric, we know that `vs` and `am` are binary columns of whether the car has a V-shaped engine and whether the car has an automatic or manual transmission.
+
+Next, we will use `summary` to summarise the `mtcars` data frame.
+
+```{r mtcars_summary}
+summary(mtcars)
+```
+
+We see that `mtcars$mpg` ranges from 10.40 to 33.90 with a mean of 20.09 and a median of 19.20. 
+
+Now, we'll take a look at the first few rows of mtcars.
+
+```{r mtcars_head}
+head(mtcars)
+```
+
+## Exploratory analysis
+
+By using the `plot` function on a `data.frame`, we can make pair-wise scatterplots for the columns in the `data.frame`. Here, we will `plot` the first five columns of `mtcars`.
+
+```{r mtcars_plot}
+plot(mtcars[,1:5])
+```
+
+We can see a few relationships between `mpg` and the other variables. One of them is `hp`, or horsepower. 
+
+Does this make sense? Do we expect that miles/gallon is inversely related to horsepower?
+Yes. We would expect that a car with greater horsepower would tend to be less efficient.
+
+## Evaluating categorical variables
+
+There are several categorical variables in the `mtcars` dataset, including `cyl`, `gear`, and `carb`. We can examine the relationship between `mpg` and `cyl` and visualise that using a boxplot.
+
+```{r mtcars_boxplot}
+boxplot(mtcars$mpg ~ mtcars$cyl, xlab = 'Number of Cylinders', ylab = 'MPG')
+```
+
+From the boxplot, we can observe that there is a stepwise decrease in mpg with increasing cylinders. There is very little overlap between the boxplots across cylinders and we can test that if there are statistically significant differences.
+
+We will run two tests. (1) an ANOVA to identify if any of the `cyl` groups have different mpg values and (2) a pairwise t-test to identify differences across groups.
+
+```{r mtcars_anova}
+## ANOVA analysis
+anova(aov(mpg ~ cyl, data = mtcars))
+
+## pairwise t-test
+pairwise.t.test(mtcars$mpg, g = mtcars$cyl)
+```
+
+In this sample, we can conclude that there are pairwise differences of mpg across number of cylinders of the car's engine.
+
+## Comparing numerical variables
+
+We will continue to explore the relationship between mpg and horsepower that we observed earlier by making a scatterplot of the two variables.
+
+```{r mtcars_hp}
+## plot( y ~ x , data = dataset)
+plot(mpg ~ hp, data = mtcars, ylab = 'MPG', xlab = 'Horsepower')
+
+## plot(x = mtcars$mpg, y = mtcars$mpg) will work as well
+```
+
+We can observe what appears to be an inverse relationship between mpg and horsepower. We can fit a linear model that 
+
+```{r mtcars_linear}
+## lm( y ~ x1 + x2 + ... + xn , data = dataset)
+summary(lm(mpg ~ hp, data = mtcars))
+```
+
+From this model, we observe that the estimate is that for every 1 point increase of horsepower, there is a decrease of -0.06823 mpg.
+
+So now we know that there is an inverse relationship between mpg and horsepower on top of the relationship between mpg and the number of cylinders.
+Let's include all that information in our plot.
+
+```{r mtcars_abline}
+## create colors
+mapcolors <- c('4'='black','6'='skyblue3','8'='orange')
+mtcolors <- mapcolors[as.character(mtcars$cyl)]
+
+## model
+mtmodel <- lm(mpg ~ hp, data = mtcars)
+
+## make basic plot
+plot(mpg ~ hp, data=mtcars, col = mtcolors, pch = 16, xlab = 'Horsepower', ylab = 'MPG',
+     main = 'MPG ~ Horsepower')
+## add fitted line
+abline(mtmodel)
+## add legend
+legend('topright', legend = c(4,6,8), col = c('black','skyblue3','orange'), pch = 16, title = 'Cylinder')
+```
+
+## Multiple regression
+
+We will explore the relationship between `vs`, V-shaped engine, and mpg. Let's first fit a model to assess that.
+
+```{r mtcars_multiple_first}
+unique(mtcars$vs)
+## V-shaped engine
+summary(lm(mpg ~ vs ,data = mtcars))
+```
+
+From this analysis, we can see that there is a significant difference between the mpg of cars with a V-shaped versus an inline engine. Do we believe that this relationship is real?
+Maybe. Or maybe there are other covariates that we have not considered.
+
+In this dataset, we will show here that cars with V-shaped engines differ from those with inline engines in horsepower and weight, and that difference captures more mpg variability than engine shape.
+
+```{r mtcars_multiple}
+boxplot(mtcars$hp ~ mtcars$vs)
+boxplot(mtcars$wt ~ mtcars$vs)
+## V-shaped engine and hp and weight
+summary(lm(mpg ~ vs + hp + wt ,data = mtcars))
+```
