@@ -16,12 +16,14 @@ knitr::opts_chunk$set(echo = TRUE)
 library(GEOquery)
 library(minfi)
 library(limma)
-library(gplots)
 
 ## source custom functions for the workshop
-source('https://raw.githubusercontent.com/sean-cho/datasets/master/src/custom_fxn.R') ## heatmap
-source('https://raw.githubusercontent.com/sean-cho/sc_toolbox/master/sig_overlap.R') ## hypergeometric test
-source('https://raw.githubusercontent.com/sean-cho/sc_toolbox/master/readgmt.R') ## readGMT
+## heatmap
+source('https://raw.githubusercontent.com/sean-cho/biotrac2018_epigenetics/master/code/custom_fxn.R') 
+## hypergeometric test
+source('https://raw.githubusercontent.com/sean-cho/biotrac2018_epigenetics/master/code/sig_overlap.R')
+## readGMT
+source('https://raw.githubusercontent.com/sean-cho/biotrac2018_epigenetics/master/code/readgmt.R') 
 
 ## other functions
 factor2char <- function(x){
@@ -667,3 +669,9 @@ plotgse(hallmarks$EPITHELIAL_MESENCHYMAL_TRANSITION, main = 'EMT')
 We can see that genes in the EMT gene set tends to be hypomethylated in our tumor vs. normal analysis. We can hypothesize that this hypomethylation leads to over-expression of EMT genes, a hallmark of cancer. However, we cannot yet conclude that, as we have to show that the expression of these genes are indeed upregulated and perform orthogonal experiments to validate some of these findings. We now have a lead hypothesis that we can pursue and test.
 
 *For fun*: Repeat this analysis comparing ER+ vs Basal tumors.
+
+#### session info
+
+```{r reprod}
+sessionInfo()
+```

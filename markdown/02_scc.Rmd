@@ -2,8 +2,8 @@
 title: "Lab 02: Analyzing squamous cell carcinoma methylation data"
 author: "Sean Cho"
 output:
-  pdf_document: default
   html_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -16,8 +16,6 @@ knitr::opts_chunk$set(echo = TRUE)
 library(GEOquery)
 library(minfi)
 library(limma)
-library(gplots)
-library(scales)
 ```
 
 For this task, we will be analysing a public dataset on the Gene Expression Omnibus (GEO), GSE67097.
@@ -64,8 +62,10 @@ if(length(list.files('data/scc/GSE67097/idat')) != 26){
     sapply(idat_files, gunzip, overwrite = TRUE) ## unzip files
 }
 
-idat_files <- list.files('data/scc/GSE67097/idat', pattern = 'idat$', full.names = TRUE)
-idat_files
+if(!file.exists('rda/scc_rawdata.rds')){
+  idat_files <- list.files('data/scc/GSE67097/idat', pattern = 'idat$', full.names = TRUE)
+  idat_files
+}
 ```
 
 ## Process metadata
@@ -74,9 +74,11 @@ Next, we will download the phenotype metadata using GEOquery. `getGEO` will down
 
 ```{r phenodata01}
 ## get phenodata
-gse <- getGEO('GSE67097')
-rawpheno <- pData(gse[[1]])
-str(rawpheno)
+if(!file.exists('rda/scc_rawdata.rds')){
+  gse <- getGEO('GSE67097')
+  rawpheno <- pData(gse[[1]])
+  str(rawpheno)
+}
 ```
 
 There are several columns of information here that we want to capture, including the tissue, gender, body source, tumor type, and if the skin source is exposed to the sun.
@@ -90,25 +92,27 @@ The `dl_metadata` data.frame will be used to import the raw data appropriately. 
 Any other columns will be appended onto the phenotype data when the data is read.
 
 ```{r phenodata02}
-## create metadata for reading data using minfi
-dl_metadata <- data.frame(do.call(rbind, strsplit(basename(idat_files), split = '_')),
-                          stringsAsFactors = FALSE)
-colnames(dl_metadata) <- c('Sample_Name', 'Slide', 'Array', 'suffix')
-dl_metadata$Basename <- gsub('_[GrnRed]+\\.idat','', idat_files)
-dl_metadata$suffix <- NULL
-dl_metadata <- unique(dl_metadata)
-
-## annotate metadata
-sun <- c('Lip','Neck','Scalp','Arm')
-nosun <- c('Calf','Leg')
-
-dl_metadata$OTissue <- rawpheno$`tissue:ch1`
-dl_metadata$OGender <- rawpheno$`gender:ch1`
-dl_metadata$OBody <- rawpheno$`body site:ch1`
-dl_metadata$Tumor <- ifelse(grepl('squamous', rawpheno$`tissue:ch1`), 'SCC', 'normal')
-dl_metadata$Sun <- ifelse(dl_metadata$OBody %in% sun, 'sun', 'nosun')
-
-head(dl_metadata)
+if(!file.exists('rda/scc_rawdata.rds')){
+  ## create metadata for reading data using minfi
+  dl_metadata <- data.frame(do.call(rbind, strsplit(basename(idat_files), split = '_')),
+                            stringsAsFactors = FALSE)
+  colnames(dl_metadata) <- c('Sample_Name', 'Slide', 'Array', 'suffix')
+  dl_metadata$Basename <- gsub('_[GrnRed]+\\.idat','', idat_files)
+  dl_metadata$suffix <- NULL
+  dl_metadata <- unique(dl_metadata)
+  
+  ## annotate metadata
+  sun <- c('Lip','Neck','Scalp','Arm')
+  nosun <- c('Calf','Leg')
+  
+  dl_metadata$OTissue <- rawpheno$`tissue:ch1`
+  dl_metadata$OGender <- rawpheno$`gender:ch1`
+  dl_metadata$OBody <- rawpheno$`body site:ch1`
+  dl_metadata$Tumor <- ifelse(grepl('squamous', rawpheno$`tissue:ch1`), 'SCC', 'normal')
+  dl_metadata$Sun <- ifelse(dl_metadata$OBody %in% sun, 'sun', 'nosun')
+  
+  head(dl_metadata)
+}
 ```
 
 ## Read raw IDAT data
@@ -120,12 +124,14 @@ The data is read into an `RGChannelSet` (red/green channel set) which is a struc
 We will extract the phenotype information using `pData` which will be ordered the same way as the signal intensity information.
 
 ```{r readidat}
-## read data
-rawdata <- read.metharray.exp(targets = dl_metadata)
-class(rawdata)
-## save rawdata for future experiments
 if(!file.exists('rda/scc_rawdata.rds')){
+  ## read data
+  rawdata <- read.metharray.exp(targets = dl_metadata)
+  class(rawdata)
+  ## save rawdata for future experiments
   saveRDS(rawdata, file = 'rda/scc_rawdata.rds')
+} else {
+  rawdata <- readRDS('rda/scc_rawdata.rds')
 }
 ## start analysis
 pheno <- pData(rawdata)
@@ -282,3 +288,8 @@ DMR.plot(ranges = scc_dmranges, dmr = 13, CpGs=bdat,
          samps = 1:ncol(bdat), toscale = TRUE)
 ```
 
+#### session info
+
+```{r reprod}
+sessionInfo()
+```
