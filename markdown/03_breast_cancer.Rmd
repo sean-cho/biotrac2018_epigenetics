@@ -1,0 +1,669 @@
+---
+title: "Lab 03: Breast cancer methylation analysis"
+author: "Sean Cho"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+```{r libs, warning=FALSE,message=FALSE}
+library(GEOquery)
+library(minfi)
+library(limma)
+library(gplots)
+
+## source custom functions for the workshop
+source('https://raw.githubusercontent.com/sean-cho/datasets/master/src/custom_fxn.R') ## heatmap
+source('https://raw.githubusercontent.com/sean-cho/sc_toolbox/master/sig_overlap.R') ## hypergeometric test
+source('https://raw.githubusercontent.com/sean-cho/sc_toolbox/master/readgmt.R') ## readGMT
+
+## other functions
+factor2char <- function(x){
+  if(is.factor(x)){
+    return(as.character(x))
+  } else {
+    return(x)
+  }
+}
+```
+
+For this task, we will be analysing a public dataset on the Gene Expression Omnibus (GEO), GSE20713.
+This GSE contains two datasets, an expression and a methylation dataset. We will be working with the latter.
+
+The methylation dataset contains 273 samples; 236 tumors, 12 normals, and 25 cell lines. There are 4 batches of data.
+
+We will be doing the following:
+
+1. Download the data
+2. Process the metadata
+3. Perform QC analysis using our own script
+4. Normalize the data and create analysis ready data
+5. Exploratory analyses: cluster analysis
+6. Identify differentially methylated probes (DMPs)
+7. Run gene set enrichment analysis
+
+## Download dataset
+
+We will be using the `GEOquery` package to download the GSE20713 dataset. The raw data in the form of IDAT is unavailable for this dataset, but the authors have uploaded the raw, unprocessed beta-values onto GEO. While it is not ideal, we can still perform QC and normalization on the data using methods that do not depend on probe level intensities.
+
+We will first download the data, in the format of raw beta-values.
+
+```{r downloadgeo}
+## get phenodata
+if(!file.exists('rda/breast_gse.rds')){
+  breast <- getGEO('GSE20713')
+  saveRDS(breast, file = 'rda/breast_gse.rds')
+} else {
+  breast <- readRDS('rda/breast_gse.rds')
+}
+
+## assign the expression and methylation datasets
+## to appropriate objects
+breast_expr <- breast[[1]]
+breast_meth <- breast[[2]]
+
+class(breast_meth)
+```
+
+Also, note that the `class` for these datasets are `ExpressionSet`s, which are data classes that are a little more processed compared to `RGChannelSet`s. `ExpressionSet`s store:
+
+1. `exprs`: the data from the array
+2. `pData`: phenotype data about the samples
+3. `fData`: feature data about the probes in the array
+
+### Explore annotation and add annotations
+
+Before we dive into the data, let's first look at the feature annotations, or probe annotations, of this microarray. There is some information here, including the gene the probe maps to, whether the probe is in a CpG island, and where it is located in the genome. 
+
+We will add a new annotation called `Promoter`, which flags a probe if it is within 1500bp to a transcriptional start site (TSS). This annotation will be used later on in visualizing our data and making sense of our data.
+
+```{r features}
+annots <- fData(breast_meth)
+str(annots, vec.len = 2, nchar.max = 20, max.level = 2)
+annots$Promoter <- ifelse(is.na(annots$Distance_to_TSS),
+                          'no','yes')
+```
+
+## Process metadata
+
+Here, we will wrangle the phenodata. 
+
+```{r phenodata01}
+str(pData(breast_meth), vec.len = 2)
+```
+
+Here, the rows are samples and columns are phenotype data.
+
+Notice that there is data regarding the experimental protocols and author information that is the same for all the samples, and not really required for our downstream analysis. We should read it to understand the experiment, but there is no need to keep these variables for downstream analysis.
+
+There are 4 submission dates, which appears to correspond to 4 different batches. We can confirm this by looking at the naming convention of the samples. 
+
+```{r checkbatch}
+head(subset(pData(breast_meth), submission_date == 'Mar 09 2010', select = title))
+head(subset(pData(breast_meth), submission_date == 'Jun 09 2010', select = title))
+```
+
+We can see that the ones submitted in Mar 09 2010 has the prefix P while the ones submitted on Jun 09 2010 has the prefix P2. The other batches correspond to cell lines. We will capture this information in a separate field.
+
+There are also repeated measures with the characteristic label appended in front of the actual value. These are conveniently parsed by `GEOquery` to remove the labels. For example, , `characteristics_ch1.6` was parsed into `agebin:ch1`.
+
+Also, many of the fields are `factor`s, that might be difficult to wrangle and we should convert those to `character` fields.
+
+Finally, there are repeated measures that we should combine and some features that are useful that we can engineer into the data. For example, `characteristics_ch1.6` and `characteristics_ch1.7` both describe the age, but for the different batches. We need to combine those into a single column.
+
+```{r phenodata02}
+#### Wrangle phenodata
+bmpheno <- data.frame(lapply(pData(breast_meth), factor2char), stringsAsFactors = FALSE)
+
+bmpheno$Samplename <- gsub('.*(?:patient|line) (.*)(?: \\(meth.*|$)', '\\1', 
+                           sapply(bmpheno$title, function(x) strsplit(x, ' \\(')[[1]][1]))
+bmpheno$Batch <- ifelse(grepl('^P_', bmpheno$Samplename), 'P1',
+       ifelse(grepl('^P2_', bmpheno$Samplename), 'P2', 
+              ifelse(grepl('^HCT', bmpheno$Samplename), 'C1', 'C2')))
+bmpheno$Tissue <- ifelse(grepl('^C', bmpheno$Batch),'cell_line',
+                         ifelse(grepl('_N', bmpheno$Samplename),
+                                'normal', 'tumor'))
+bmpheno$IHC <- ifelse(is.na(bmpheno$subtype.ihc.ch1),
+                      bmpheno$subtypeihc.ch1, bmpheno$subtype.ihc.ch1)
+bmpheno$IHC <- ifelse(is.na(bmpheno$IHC), 'cell_line', bmpheno$IHC)
+bmpheno$Age <- ifelse(is.na(bmpheno$age.bin.ch1), bmpheno$agebin.ch1, bmpheno$age.bin.ch1)
+rownames(bmpheno) <- bmpheno$Samplename
+
+bmpheno <- bmpheno[,c(1:2,53:ncol(bmpheno))]
+str(bmpheno)
+```
+
+## Get beta-values and match with phenodata
+
+Now, we extract the beta-values using `exprs`. We can see that the data is organized with columns as samples and rows as probes.
+
+Since `bmpheno` contains the phenotypic data for our methylation dataset, we should verify that the sample names are matching. For that, we use `==` to compare the colnames of the methylation dataset to the rownames of the phenodata in order. The function `all` assesses if all the elements of a logical vector are `TRUE`. Once we verify that match, we can then rename the samples from their GEO identifiers (`GSMNN...NN`) to the sample IDs provided by the study. These are shorter, sometimes informative on the biology of the sample, and will allow us to identify and match samples with expression data.
+
+```{r match}
+## Get beta value
+bm_beta_raw <- exprs(breast_meth)
+head(bm_beta_raw[,1:5])
+
+## all checks a logical vector and returns TRUE if 
+## all entries in the vector is true
+all(colnames(bm_beta_raw) == bmpheno$geo_accession)
+colnames(bm_beta_raw) <- bmpheno$Samplename
+
+## Make colors
+# Batch
+mapper_batch <- c('P1'='orange','P2'='skyblue3',
+                  'C1'='grey','C2'='forestgreen')
+colors_batch <- mapper_batch[bmpheno$Batch]
+```
+
+## QC 
+
+`qcReport` only works on `RGChannelSet`, and since we don't have the raw data, we will not be able to generate one. Here, we will write our own custom function to make beta-value density plots. We first extract the densities using `density` and use `apply` to loop through every column.
+
+The `density` output returns a named list with `$x` and `$y` which describes the plotting coordinates of a density curve. We know that the beta-values fall between 0 and 1, but we have to find the limits of y using `range` and `lapply` to extract the information.
+
+```{r betaqc}
+## Get density information
+bm_density <- apply(bm_beta_raw, 2, density, na.rm = TRUE)
+ylimits <- range(unlist(lapply(bm_density, '[[', 'y')))
+```
+
+Now that we have all the densities calculated and the y-limits, let's make our plot.
+
+```{r qc_batch}
+## Make plot
+# Batch
+plot(0, type = 'n', ylim = ylimits, xlim = c(0,1), 
+     main = 'Density plots',  xlab = 'beta-values', 
+     ylab = 'Density')
+for(i in 1:length(bm_density)){
+  lines(bm_density[[i]], col = colors_batch[i])
+}
+legend('topright', legend = names(mapper_batch),
+       col = mapper_batch, lwd = 3,
+       title = 'Batch')
+```
+
+While we don't observe a bimodal distribution with modes around 0.1 (for unmethylated loci) and 0.9 (for methylated loci), this doesn't immediately mean that there is something wrong with this array. These density curves suggest that for the our samples are largely unmethylated in many of the probes that are measured by this microarray. A poorly performing sample tends to have density curves with a unimodal distribution at 0.5. Without additional information from the raw IDAT files, it will be difficult to evaluate further.
+
+Another observation is that the C1 and C2 batches appear to have different distributions that the P1 and P2 distribution. This could either be due to these being the batches with cell lines treated under various conditions or an effect associated with batch. Unfortunately, since there are no tumor samples in the C batches and cel line samples in the P batches, we will not be able to distinguish these effects. Fortunately for us, we won't be analysing the cell line data today. However, if we have to, we should normalize and analyse the cell line data separately, and make comparisons based on diffential methylation statistics over actually comparing beta-values of tumors vs. cell lines.
+
+## Subset only tissue data
+
+Given the density curves above, we will filter away the cell line samples using logical indexing.
+
+```{r subset}
+## logical indexing
+idx <- bmpheno$Tissue != 'cell_line'
+tm_beta_raw <- bm_beta_raw[,idx]
+tmpheno <- bmpheno[idx,]
+```
+
+## Make colors
+
+To aid visualizing that data, we will make color vectors correspondong to the batch, IHC status, and tissue of the samples. The concept here is to use a named list and subsetting to map colors onto a vector.
+
+For example, let's say we have a vector called `students` with elements of either a student living in the dorms or off campus. We can first make a vector with names `dorms` and `offcampus` and the corresponding colors. We can then subset that using the `students` vector and that will pull out the color assigned to the name since this just pulls the element matching the name regardless if the name has been matched previously.
+
+```{r makecolorsexample}
+students <- c('dorms','offcampus','dorms','dorms','offcampus')
+mapper <- c('dorms' = 'skyblue3', 'offcampus' = 'orange')
+mapper['dorms']
+mapper[c('dorms','dorms')]
+mapper[students]
+```
+
+Using the same scheme, we will make the necessary colors for this dataset.
+
+```{r makecolors}
+## Make colors
+# Batch
+mapper_batch <- c('P1'='orange','P2'='skyblue3',
+                  'C1'='grey','C2'='forestgreen')
+colors_batch <- mapper_batch[tmpheno$Batch]
+# Tissue
+mapper_tissue <- c('tumor'='orange', 
+                   'normal'='skyblue3',
+                   'cell_line'='grey')
+colors_tissue <- mapper_tissue[tmpheno$Tissue]
+# IHC
+mapper_ihc <- c('Basal'='orange','HER2'='forestgreen', 
+                'LumA'='skyblue2', 'LumB'='blue',
+                'Normal'='grey70', 'cell_line'='grey20') 
+colors_ihc <- mapper_ihc[tmpheno$IHC]
+```
+
+## Normalize the data
+
+Then, we remove probes with missing information and use the `normalizeQuantlies` function to perform quantile normalization to our data. We cannot use `funnorm` because that requires information available in the raw IDAT files or an `RGChannelSet`. Quantiles will work for our purposes, especially for such a large sample size.
+
+```{r normalize}
+#### Methylation data
+tm_beta_raw <- tm_beta_raw[complete.cases(tm_beta_raw),]
+tm_beta <- normalizeQuantiles(tm_beta_raw)
+```
+
+## Compare
+
+Let's visualize the distributions before and after normalization.
+
+```{r compare_beta}
+boxplot(tm_beta_raw, col = colors_batch)
+boxplot(tm_beta, col = colors_batch)
+```
+
+As observed, the quantile normalization normalized the data such that the quantiles of each sample lines up with the other. Dr. Wayne Yu will go into greater detail regarding normalization methods tomorrow. We now have analysis ready data.
+
+## Exploratory analysis
+
+With this high dimensional data, we can start performing unsupervised analyses to explore structures within the data. We can draw correlations between these structures and biological phenotypes of interest, perhaps observing new relationships that we can generate hypotheses for.
+
+### Curse of dimensionality
+
+With high dimensional data, there are many features (probes in this case) and few samples. This leads to unique problems that the field has to address. 
+
+A common problem is that high dimensionality allows us to overfit the data to answer the questions that we may have. This is most evident in machine learning and classification problems, where with enough data points about every single subject, one can train a classifier to perfectly classify each sample. However, when the same classifier is used in a different cohort, the classifier underperforms, because the model learned incorrect relationships between the features and the phenotype of interest.
+
+It is also more difficult to represent or visualize the data so that we can start exploring structures within the data itself. Beyond that, features can be colinear, which offers us an opportunity to summarise these dimensions into more tractable datasets through a process called dimensionality reduction.
+
+Here, we will use two major types of dimensionality reduction, (1) feature projection and (2) feature selection, to visualize and explore our data. 
+
+We will only be describing the concepts briefly and introducing the functions that perform these analyses, as a deeper discussion is beyond the goal of this lab session.
+
+### Classical multidimensional scaling
+
+Note that MDS represents a class of feature projection methods, but for the purposes of this document, it will be used to refer to classical MDS as performed by the R `cmdscale` function.
+
+The first approach is called classical multidimensional scaling (MDS), which is a feature projection technique. MDS tries to preserve the pairwise distances between all samples in a complex data space as they are projected into lower dimensions. Imagine flattening a 3D object to a 2D object across a single plane and choosing the angle to flatten to maximize distances of all the elements up to their original distances.
+
+This has been implemented in the `minfi` package using the function `mdsPlot`. We will be providing 3 arguments to the function: 
+
+1. The beta-values matrix, `tm_beta`.
+2. The phenotype of interest as a group. In this case, IHC status, `tmpheno$IHC`
+3. A palette of how we want the plot colored.
+
+```{r mds}
+mdsPlot(tm_beta, sampGroups = tmpheno$IHC, pch = 16, pal = mapper_ihc, numPositions = 1000)
+```
+
+The orientation of the x- and y-axes are arbitrary, and the scales are relative. It is unintuitive to relate how different a pair of samples are if they are one unit apart in the x axis vs another pair which is one unit apart in y. However, this preserves the structure of the data and we can start identifying which samples are more similar to each other.
+
+We observe that `normal` samples tend to cluster together. `Luminals`, `LumA` and `LumB`, co-cluster away from the HER2 and `basal` samples. `Basals` are the most distant from the luminals. In this dataset, we observe a higher degree structure or clustering of the samples to a known biological phenotype relevant to disease, suggesting that this dataset and approach is capturing variation of interest.
+
+### Most variable probes
+
+Note that in the MDS exercise, the `numPositions` argument was set to 1000 (the default). Here, we are making an assumption and performing an unsupervised feature selection. 
+
+Often, a small number of probes or features capture most of the variation in the data set. A majority of the probes could have no variability in the tissue that we are studying. In other words, if we select the top X%, let's say 5 or 10% of the probes, we can start observing structures between the samples. This reduces our search space and makes our calculations faster (recall that MDS works on pairwise distances, so the computation time increases exponentially with n).
+
+In the next analysis, we will also simplify our analysis by selecting most variable probes. Here, we will use standard deviation of each probe to do so. The function `rowSds` calculates the standard deviations of each row (probes). We will extract the top 1000 probes and subset our beta-values matrix as `tm_mvp`. The probe names are stored as `mvp_names`.
+
+```{r mvp}
+tm_sd <- rowSds(tm_beta)
+top1000q <- (nrow(tm_beta) - 1000)/nrow(tm_beta)
+mvp_idx <- tm_sd >= quantile(tm_sd, top1000q)
+tm_mvp <- tm_beta[mvp_idx,]
+mvp_names <- rownames(tm_mvp)
+```
+
+### Principal component analysis
+
+Principal component analysis (PCA) is also a feature projection method with similar goals as the MDS described above. The approaches used are slightly different. PCA attempts to maximizing variation by looking for orthogonal components in the data called principal components (PCs). We will use `prcomp`. With the default arguments, `prcomp` returns similar projections as `mdsPlot` as observed later.
+
+We will estimate the PCs and investigate at the proportion of variance captured by the first 10 PCs.
+
+```{r pca}
+tmpca <- prcomp(t(tm_mvp))
+summary(tmpca)$importance[,1:10]
+barplot(summary(tmpca)$importance[2,1:10], ylab = 'Percent variation explained', xlab = 'PC', main = 'Variance explained by PCs')
+```
+
+The first row shows the standard deviations of the PCs, the second shows the proportion of variance of the original data that it captures, and finally the cumulative proportion with increasing PCs. We see here that PC1 captures 26.19% of the variation in `tm_mvp`, PC2 captures 8.4%, and so on.
+
+We can take the rotated data, or projections, stored in `$x` and plot that.
+
+```{r pcaplot}
+plot(tmpca$x[,1], tmpca$x[,2], pch = 16, col = colors_ihc,
+     main = 'PCA\n1000 most variable probes',
+     xlab = 'PC1 (26.1%)', ylab = 'PC2 (8.4%)')
+```
+
+### Clustering analysis
+
+We see some structure in the dataset, now let's visualize that with the beta-values using a heatmap. We will be using a custom function sourced earlier called `myheatmap3`. This function will (1) perform clustering analysis on the samples and the genes, (2) plots the heatmap, and (3) allow us to add column side and row side color matrices to annotate our samples and probes respectively.
+
+First, we make the color matrices using the same approach we did as before. We will then visualize `tm_mvp`.
+
+```{r heatmap, fig.width=11, fig.height=8}
+## make column side colors
+# tissue type
+hmcolor_tissue <- c('normal' = 'white', 'tumor' = 'black', 'NA' = 'grey')[tmpheno$Tissue]
+# er status
+hmcolor_er <- c('0' = 'white', '1' = 'black', 'NA' = 'grey')[tmpheno$er.ch1]
+# her2 status
+hmcolor_her2 <- c('0' = 'white', '1' = 'black', 'NA' = 'grey')[tmpheno$her2.ch1]
+# age
+hmcolor_age <- c('0' = 'white', '1' = 'black', 'NA' = 'grey')[tmpheno$Age]
+# batch
+hmcolor_batch <- c('P1' = 'white', 'P2' = 'black', 'NA' = 'grey')[tmpheno$Batch]
+# ihc
+hmcolor_ihc <- colors_ihc
+# make the matrix
+column_colors <- cbind(Tissue = hmcolor_tissue, ER = hmcolor_er, Her2 = hmcolor_her2, 
+                       Age = hmcolor_age, Batch = hmcolor_batch, IHC = hmcolor_ihc)
+## make row side colors
+# promoter
+hmrow_promoter <- ifelse(annots[mvp_names,]$Promoter == 'yes', 'black', 'white')
+# cpg island
+hmrow_cpgi <- ifelse(annots[mvp_names,]$CPG_ISLAND, 'black', 'white')
+# make the matrix
+row_colors <- rbind(NA, NA, NA, NA,
+                    Promoter = hmrow_promoter,
+                    CpGI = hmrow_cpgi)
+## heatmap
+myheatmap3(tm_mvp, ColSideCol = column_colors, 
+           RowSideCol = row_colors,
+           side.height.fraction=0.8, labRow = NA, labCol = NA,
+           margins = c(6,3))
+legend(0, 0.8, legend = names(mapper_ihc), fill = mapper_ihc, cex = 0.7)
+```
+
+Here, the samples separate into two major clusters of `Basal` vs `Luminal` tumors. The probes cluster into CpG island and non-CpG island clusters. We can infer additional subcluster information from this plot and very the number of probes to discover additional relationships if we want to.
+
+These three methods are commonly used methods to first explore the data, describe and annotate relationships between the samples and features.
+
+## Identify DMPs using limma
+
+As with the squamous cell carcinoma (SCC) analysis, we will identify differentially methylated probes using `limma`. To keep things simple for the analysis and visualization, we won't be using batch as a covariate. If we have time, we will come back to this and add batch as a covariate.
+
+### Get M-values, design matrix and contrasts
+
+Since we did not begin with a `GenomicRatioSet`, we will have to transform our data from beta-values to M-values manually using the convenient `logit2` function from `minfi`.
+
+We will create a design matrix with `tumor` and `normal` and create contrasts against them.
+
+```{r dmp}
+## get M-values
+tm_m <- logit2(tm_beta)
+## make model matrix and contrasts
+tissue_model <- model.matrix(~ 0 + tmpheno$Tissue)
+colnames(tissue_model) <- c('tumor','normal')
+tissue_contrasts <- makeContrasts(tumor - normal, levels = tissue_model)
+```
+
+### Fit the model
+
+Again, we will use `lmFit`, `contrasts.fit`, and `eBayes` to identify the DMPs. Finally, we will use `top.table` to extract the DMPs.
+
+```{r fit}
+## fit model
+tissue_fit1 <- lmFit(tm_m, design = tissue_model)
+tissue_fit2 <- contrasts.fit(tissue_fit1, tissue_contrasts)
+tissue_eb <- eBayes(tissue_fit2)
+tissue_res <- topTable(tissue_eb, coef = 1, number = nrow(tm_m))
+
+## do the same for beta-values
+tissue_fit1b <- lmFit(tm_beta, design = tissue_model)
+tissue_fit2b <- contrasts.fit(tissue_fit1b, tissue_contrasts)
+tissue_ebb <- eBayes(tissue_fit2b)
+tissue_resb <- topTable(tissue_ebb, coef = 1, number = nrow(tissue_ebb))
+
+## flag differentially methylated probes
+dmps <- rownames(tissue_res)[tissue_res$adj.P.Val <= 0.05] ## FDR < 0.05 in M-value
+dmps <- dmps[abs(tissue_resb[dmps,]$logFC) >= 0.3] ## delta beta >= 0.3
+tissue_resb$mfdr <- tissue_res[rownames(tissue_resb),]$adj.P.Val
+tissue_resb$DMP <- rownames(tissue_resb) %in% dmps
+
+head(tissue_resb)
+```
+
+Here, we can see that there are only 16 DMPs identified between tumor and normal using our relatively stringent criteria.
+
+```{r alldmps}
+sum(tissue_resb$DMP)
+head(subset(tissue_resb, DMP))
+```
+
+Visualizing the DMPs using a volcano plot, we observe that a majority of the probes were filtered away using the 0.3 threshold. There are technological differences between 27k and 450k probes, and we can be less stringent in our decision of a delta-beta threshold.
+
+```{r volcano}
+plot(x = tissue_resb$logFC, y = -log10(tissue_resb$adj.P.Val), 
+     col = ifelse(tissue_resb$DMP, 'orange', 'skyblue'), pch = 16,
+     ylab = '-log10 FDR', xlab = 'Delta Beta', main = 'Differentially Methylated Probes')
+```
+
+### Annotate result
+
+Next, we annotate our `top.table` with the `annots` data.frame from the beginning of the analysis. We do so by using the `merge` function. `merge` returns a `data.frame` sorted by the column that is used to merge the data.frames. We will sort the output using the `order` function.
+
+```{r annot}
+toannotate <- annots[,c('Symbol', 'CPG_ISLAND', 'Distance_to_TSS', 'Promoter')]
+## merge table 1 with table 2 by column. If by = 0, by row names
+tissue_annotated <- merge(tissue_resb, toannotate, by = 0) 
+rownames(tissue_annotated) <- tissue_annotated$Row.names
+tissue_annotated$Row.names <- NULL
+## rearrange by pvalue and logfc
+tissue_annotated <- tissue_annotated[order(
+  -tissue_annotated$DMP, ## first by inverse DMP status
+  tissue_annotated$mfdr, ## then by p-values (low to high)
+  -1*abs(tissue_annotated$logFC)),] ## then by inverse delta-beta
+tissue_annotated$dmp0.3 <- tissue_annotated$mfdr <= 0.05 & abs(tissue_annotated$logFC) >= 0.3
+tissue_annotated$dmp0.2 <- tissue_annotated$mfdr <= 0.05 & abs(tissue_annotated$logFC) >= 0.2
+head(tissue_annotated)
+```
+
+## Gene set analysis
+
+Since we have information on which probes map to which genes, we can consider using gene set analysis to identify potential sets of genes or pathways that are associated with our phenotype of interest. We will explore two classes of analysis, over-representation analysis (ORAs) and functional class scoring (FCS).
+
+We will download the [Hallmark gene sets](http://software.broadinstitute.org/gsea/msigdb/genesets.jsp?collection=H) from the [Molecular Signatures Database](http://software.broadinstitute.org/gsea/msigdb/index.jsp). Hallmark gene sets are meant to summarise specific biological processes and states derived from gene expression data.
+
+```{r getfxn}
+
+## get gene sets
+hallmarks <- readgmt('https://raw.githubusercontent.com/sean-cho/datasets/master/datasets/h.all.v6.2.symbols.gmt')$genesets
+names(hallmarks) <- gsub('HALLMARK_', '', names(hallmarks))
+names(hallmarks)
+```
+
+## Preparing vectors for comparison
+
+Here, we will flag two levels of DMPs for gene set analysis:
+
+1. DMP0.3
+    1. FDR <= 0.05 in the M-value analysis
+    2. abs(delta beta) >= 0.3 in the beta-value analysis
+    
+2. DMP0.2
+    1. FDR <= 0.05 in the M-value analysis
+    2. abs(delta beta) >= 0.2 from beta-value analysis
+
+We will also write a convenience function that will summarise our data from probes to genes. Finally, we will make a vector called `gene_statistics` that will be used for functional class scoring analysis.
+
+```{r dmpvectors}
+## 0.3
+genes0.3 <- names(which(tapply(tissue_annotated$dmp0.3, 
+                               tissue_annotated$Symbol, max) == 1))
+length(genes0.3)
+
+## 0.2
+genes0.2 <- names(which(tapply(tissue_annotated$dmp0.2, 
+                               tissue_annotated$Symbol, max) == 1))
+length(genes0.2)
+
+## get entry with the highest difference
+getbest <- function(x) x[which.max(abs(x))]
+
+## moderated t-statistic
+genesall <- unique(tissue_annotated$Symbol)
+gene_statistics <- tapply(tissue_annotated$t, tissue_annotated$Symbol, getbest)
+```
+
+### Gene sets
+
+[GSEA](http://software.broadinstitute.org/gsea/index.jsp)
+
+## Over-representation analysis
+
+ORA methods test for over-representation of genes in a particular gene set amongst genes that are defined as differentially methylated. Therefore, the investigator has to choose a threshold to classify their probes, and subsequently genes, as differentially methylated. This threshold is subjective (more sensitive or specific), and different thresholds from the same analysis could lead to differences in ORA results. 
+
+### Hypergeometric test
+
+One major implementation of ORA is the hypergeometric test. Conceptually, it considers the following scenario. 
+
+1. We are given an urn containing `m` colored balls and `n` non-colored balls.
+2. Randomly draw `k` balls out of the urn without replacement.
+3. What is the probability observing `j` or more colored balls?
+
+In our scenario,
+
+1. `m` = number of genes in gene set
+2. `n` = number of genes in the gene universe not in the gene set
+3. `k` = number of differentially expressed genes
+4. `j` = number of differentially expressed genes within the gene set
+
+I have written a function called `sig_overlap` that we have sourced previously to perform a hypergeometric test against the Hallmark gene sets.
+
+We will be using a `for` loop to run this analysis.
+
+```{r hypergeom}
+hg0.3_pval <- c()
+hg0.2_pval <- c()
+hg0.3_n <- c()
+hg0.2_n <- c()
+for(i in 1:length(hallmarks)){
+  geneset <- hallmarks[[i]]
+  univ <- union(genesall,geneset)
+  hg0.2_n[i] <- sum(genes0.2 %in% geneset)
+  hg0.3_n[i] <- sum(genes0.3 %in% geneset)
+  hg0.2_pval[i] <- sig_overlap(genes0.2,geneset,univ)
+  hg0.3_pval[i] <- sig_overlap(genes0.3,geneset,univ)
+}
+hg_res <- data.frame(
+  genesets = names(hallmarks),
+  hg0.2p = hg0.2_pval,
+  hg0.2n = hg0.2_n,
+  hg0.3p = hg0.3_pval,
+  hg0.3n = hg0.3_n
+  )
+hg_res
+```
+
+### Fisher's exact test
+
+Fisher's exact test can also be used to perform ORA. To run this analysis in R, we have to first set up a contingency (2 x 2) table. We will test for independence of the variables use to set up the contingency table.
+
+Given a contingency table, how many times can we observe the values distributed at the observed extreme or more if we maintained the same total for each row and column?
+
+```{r contingency}
+geneset1 <- hallmarks[[1]]
+ctab <- table(genesall %in% genes0.3, genesall %in% geneset1, dnn = c('DMP','geneset'))
+ctab
+fisher.test(ctab)
+```
+
+Again, we will use a `for` loop to analyse the data for every Hallmark gene set.
+
+```{r fishers}
+fe0.2_pval <- c()
+fe0.2_n <- c()
+fe0.3_pval <- c()
+fe0.3_n <- c()
+for(i in 1:length(hallmarks)){
+  geneset <- intersect(hallmarks[[i]], genesall)
+  ctab0.2 <- table(genesall %in% genes0.2,genesall %in% geneset)
+  ctab0.3 <- table(genesall %in% genes0.3,genesall %in% geneset)
+    table(genesall %in% genes0.2,genesall %in% geneset)
+  fe0.2_pval[i] <- fisher.test(ctab0.2,
+                               alternative = 'greater')$p.value
+  fe0.2_n[i] <- ctab0.2[2,2]
+  fe0.3_pval[i] <- fisher.test(ctab0.3,
+                               alternative = 'greater')$p.value
+  fe0.3_n[i] <- ctab0.3[2,2]
+}
+# names(fe0.2_pval) <- names(hallmarks)
+# names(fe0.3_pval) <- names(hallmarks)
+fisher_res <- data.frame(
+  genesets = names(hallmarks),
+  fe0.2p = fe0.2_pval,
+  fe0.2n = fe0.2_n,
+  fe0.3p = fe0.3_pval,
+  fe0.3n = fe0.3_n
+  )
+fisher_res
+```
+
+### Compare
+
+Let us compare the results between the hypergeometric test and Fisher's exact test. We will plot the p-values of each test, and the number of genes overlapping the gene set to the left of the point in the scatter plot.
+
+```{r comparetests}
+plot(fisher_res$fe0.2p, hg_res$hg0.2p, pch = 16, 
+     xlab = 'Fisher', ylab = 'Hypergeometric', 
+     main = 'DMPs logFC >= 0.2')
+text(fisher_res$fe0.2p - 0.02, hg_res$hg0.2p, hg_res$hg0.2n)
+plot(fisher_res$fe0.3p, hg_res$hg0.3p, pch = 16,
+     xlab = 'Fisher', ylab = 'ypergeometric', 
+     main = 'DMPs logFC >= 0.3')
+text(fisher_res$fe0.3p - 0.02, hg_res$hg0.3p, hg_res$hg0.3n)
+```
+
+We observe that for the `beta >= 0.2` analysis, the p-values from the hypergeometric test and the Fisher's exact test are largely correlated. This is because Fisher's exact test, especially in our scenario of comparing only one-tail, calculates its probabilities assuming a hypergeometric distribution. 
+
+Interestingly, we see that relationship disappear when there are no differentially methylated genes in the gene set. This violates an assumption made by the hypergeometric test, and therefore is unreliable. Always take into account the number of overlapping genes.
+
+## Functional class scoring (FCS)
+
+FCS approaches hypothesizes that both large changes in individual genes and concerted smaller changes in a set of functionally related genes can contribute to a biological phenotype. Therefore, the test considers the complete set of feature changes derived from a given experiment. 
+
+Briefly, these methods:
+
+1. Calculates differential methylation gene-wise statistics.
+2. Calculates a pathway/gene set score based on (1).
+3. Tests for significance by permuting a null hypothesis by shuffling gene or sample labels.
+
+We will be using the mean-rank gene set enrichment (MR-GSE) test, implemented using `wilcoxGST` in `limma`. We will write a convenience function that performs the analysis and plots the results. We will use `apply` to run the analysis on all gene sets and perform p-value adjustment using Benjamini-Hochberg's FDR method. This will take a few moments.
+
+```{r gse}
+## convenience functions: gene set test wrapper and plotting
+gstestwrapper <- function(gs, alternative = 'mixed'){
+  cat('|')
+  gs_idx <- names(gene_statistics) %in% gs
+  n <- sum(gs_idx)
+  pval <- wilcoxGST(gs_idx, gene_statistics, alternative = alternative)
+  return(c(N = n, pval = pval))
+}
+
+plotgse <- function(gs, ...){
+  gs_idx <- names(gene_statistics) %in% gs
+  barcodeplot(statistics = as.numeric(gene_statistics), 
+              index = gs_idx, ...)
+}
+
+tissue_gse <- data.frame(t(sapply(hallmarks, gstestwrapper, alternative = 'less')), 
+                         stringsAsFactors = FALSE)
+tissue_gse <- tissue_gse[order(tissue_gse$pval),]
+tissue_gse$qval <- p.adjust(tissue_gse$pval, method = 'fdr')
+```
+
+Let's subset the results for gene sets that are significant with an FDR <= 0.05.
+
+```{r gseexplore}
+subset(tissue_gse, qval <= 0.05)
+```
+
+The most significant gene set is EMT with 188 genes inside the gene set. Let's visualize that relationship.
+
+```{r plotgse}
+plotgse(hallmarks$EPITHELIAL_MESENCHYMAL_TRANSITION, main = 'EMT')
+```
+
+We can see that genes in the EMT gene set tends to be hypomethylated in our tumor vs. normal analysis. We can hypothesize that this hypomethylation leads to over-expression of EMT genes, a hallmark of cancer. However, we cannot yet conclude that, as we have to show that the expression of these genes are indeed upregulated and perform orthogonal experiments to validate some of these findings. We now have a lead hypothesis that we can pursue and test.
+
+*For fun*: Repeat this analysis comparing ER+ vs Basal tumors.

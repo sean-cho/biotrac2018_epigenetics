@@ -1,5 +1,5 @@
 ---
-title: "Squamous Cell Carcinoma"
+title: "Lab 02: Analyzing squamous cell carcinoma methylation data"
 author: "Sean Cho"
 output:
   pdf_document: default
@@ -70,7 +70,7 @@ idat_files
 
 ## Process metadata
 
-Next, we will download the phenotype metadata using GEOquery. `getGEO` will download all the data into a `list` because some GSE entries has multiple associated data sets. GSE67097 only has one so we will extract the data using `[[1]]`.
+Next, we will download the phenotype metadata using GEOquery. `getGEO` will download all the data into a `list` because some GSE entries has multiple associated data sets. GSE67097 only has one entry so we will extract the data using `[[1]]`.
 
 ```{r phenodata01}
 ## get phenodata
@@ -124,8 +124,8 @@ We will extract the phenotype information using `pData` which will be ordered th
 rawdata <- read.metharray.exp(targets = dl_metadata)
 class(rawdata)
 ## save rawdata for future experiments
-if(!file.exists('data/scc/scc_rawdata.rds')){
-  saveRDS(rawdata, file = 'data/scc/scc_rawdata.rds')
+if(!file.exists('rda/scc_rawdata.rds')){
+  saveRDS(rawdata, file = 'rda/scc_rawdata.rds')
 }
 ## start analysis
 pheno <- pData(rawdata)
