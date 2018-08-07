@@ -1,13 +1,15 @@
-## Biotrac 2018 Epigenetic Workshop
+## Biotrac 2018 Epigenetics Workshop
+
 Date: Aug 08, 2018
+
 Author: Sean, Soonweng, Cho
 
-Lecture and lab materials for the Biotrac 2018 Advanced Epigenetics Workshop.
+Epigenomics lecture and lab materials for the Biotrac 2018 Advances in Epigenetics Workshop.
 
 ### Materials
 
-Custom scripts used in lab are available in `code`.
+Custom functions used in lab are located in `code`.
 
-Self-contained, reproducible lab exercises are available in `markdown`.
+Self-contained, reproducible lab exercises are available under `markdown`.
 
-Presentations are available in `presentation`.
+Presentations are available under `presentations`.
