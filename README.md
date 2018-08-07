@@ -1,10 +1,10 @@
-## Biotrac 2018 Epigenetic Workshop
+## Biotrac 2018 Epigenetics Workshop
 
 Date: Aug 08, 2018
 
 Author: Sean, Soonweng, Cho
 
-Lecture and lab materials for the Biotrac 2018 Advanced Epigenetics Workshop.
+Epigenomics lecture and lab materials for the Biotrac 2018 Advanced Epigenetics Workshop.
 
 ### Materials
 
