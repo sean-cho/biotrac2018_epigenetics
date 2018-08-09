@@ -1,3 +1,4 @@
+## Modified from code by @nachocab at https://gist.github.com/nachocab/3853004
 heatmap.3 <- function(x,
          Rowv = TRUE, Colv = if (symm) "Rowv" else TRUE,
          distfun = dist,
